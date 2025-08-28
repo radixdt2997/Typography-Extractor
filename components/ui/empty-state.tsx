@@ -1,32 +1,50 @@
-import { Type } from "lucide-react";
+import { Card } from "@/components/ui/card";
+import { Type, Search, Globe, Zap } from "lucide-react";
 
 export function EmptyState() {
   return (
-    <div className="text-center py-16">
-      <div className="w-20 h-20 bg-gradient-to-br from-blue-100 to-blue-200 rounded-2xl flex items-center justify-center mx-auto mb-6 shadow-lg">
-        <Type className="w-10 h-10 text-blue-600" />
+    <Card className="p-12 text-center bg-gradient-to-br from-white to-gray-50 border-2 border-dashed border-gray-200">
+      <div className="max-w-md mx-auto space-y-6">
+        <div className="relative">
+          <div className="p-4 bg-gradient-to-br from-blue-100 to-indigo-100 rounded-full mx-auto w-fit">
+            <Type className="w-12 h-12 text-blue-600" />
+          </div>
+          <div className="absolute -top-2 -right-2 p-1 bg-gradient-to-r from-emerald-400 to-emerald-500 rounded-full">
+            <Zap className="w-4 h-4 text-white" />
+          </div>
+        </div>
+
+        <div className="space-y-3">
+          <h3 className="text-xl font-bold text-gray-900">
+            Ready to Analyze Typography
+          </h3>
+          <p className="text-gray-600 leading-relaxed">
+            Enter a website URL above to extract and analyze its typography
+            styles. Get detailed insights about fonts, sizes, colors, and more.
+          </p>
+        </div>
+
+        <div className="grid grid-cols-3 gap-4 pt-4">
+          <div className="text-center">
+            <div className="p-3 bg-blue-50 rounded-lg mb-2">
+              <Search className="w-6 h-6 text-blue-600 mx-auto" />
+            </div>
+            <div className="text-xs text-gray-600 font-medium">Extract</div>
+          </div>
+          <div className="text-center">
+            <div className="p-3 bg-purple-50 rounded-lg mb-2">
+              <Type className="w-6 h-6 text-purple-600 mx-auto" />
+            </div>
+            <div className="text-xs text-gray-600 font-medium">Analyze</div>
+          </div>
+          <div className="text-center">
+            <div className="p-3 bg-emerald-50 rounded-lg mb-2">
+              <Globe className="w-6 h-6 text-emerald-600 mx-auto" />
+            </div>
+            <div className="text-xs text-gray-600 font-medium">Visualize</div>
+          </div>
+        </div>
       </div>
-      <h3 className="text-2xl font-bold text-gray-900 mb-3">
-        Ready to Analyze Typography
-      </h3>
-      <p className="text-gray-600 mb-8 max-w-lg mx-auto leading-relaxed">
-        Enter any website URL above to extract and analyze its complete
-        typography information. Click on elements to view their CSS properties.
-      </p>
-      <div className="flex justify-center space-x-8 text-sm text-gray-500">
-        <div className="flex items-center">
-          <div className="w-3 h-3 bg-blue-600 rounded-full mr-2"></div>
-          Interactive Selection
-        </div>
-        <div className="flex items-center">
-          <div className="w-3 h-3 bg-emerald-600 rounded-full mr-2"></div>
-          CSS Properties
-        </div>
-        <div className="flex items-center">
-          <div className="w-3 h-3 bg-purple-600 rounded-full mr-2"></div>
-          Export Data
-        </div>
-      </div>
-    </div>
+    </Card>
   );
 }
