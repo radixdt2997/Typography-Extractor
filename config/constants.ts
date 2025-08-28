@@ -81,3 +81,19 @@ export const BROWSER_ARGS = [
   "--disable-images",
   `--window-size=${CONFIG.VIEWPORT.width},${CONFIG.VIEWPORT.height}`,
 ] as const;
+
+export const API_ENDPOINTS = {
+  ANALYZE_TYPOGRAPHY: "/api/analyze-typography",
+} as const;
+
+export const UI_CONSTANTS = {
+  SCREENSHOT_HEIGHT: 600,
+  MAX_FONT_PREVIEW: 9,
+  TEXT_PREVIEW_LENGTH: 50,
+  CSS_COMMENT_LENGTH: 30,
+} as const;
+
+export const VALIDATION_MESSAGES = {
+  EMPTY_URL: "Please enter a valid URL",
+  INVALID_URL: "Please enter a valid URL (include http:// or https://)",
+} as const;

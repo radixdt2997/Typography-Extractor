@@ -1,6 +1,5 @@
 import { TEXT_SELECTORS } from "@/config/constants";
 import { TypographyElement, TypographySummary } from "@/types/typography";
-import { rgbToHex } from "@/utils/text-processing";
 import { Page } from "puppeteer";
 
 /**
@@ -12,12 +11,24 @@ export const extractTypographyData = async (
   maxElements: number
 ): Promise<TypographyElement[]> => {
   return page.evaluate(
-    (selectors, includeHidden, maxElements, rgbToHexFn) => {
-      const rgbToHex = new Function("rgb", rgbToHexFn) as (
-        rgb: string
-      ) => string;
+    (selectors, includeHidden, maxElements) => {
       const elements: TypographyElement[] = [];
       const allElements = document.querySelectorAll(selectors.join(", "));
+
+      const rgbToHex = (rgb: string): string => {
+        if (rgb.startsWith("#")) return rgb.toUpperCase();
+
+        const rgbMatch = rgb.match(
+          /rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*[\d.]+)?\)/
+        );
+        if (!rgbMatch) return rgb;
+
+        const [, r, g, b] = rgbMatch.map(Number);
+        if ([r, g, b].some((val) => val > 255 || val < 0)) return rgb;
+
+        const toHex = (n: number): string => n.toString(16).padStart(2, "0");
+        return `#${toHex(r)}${toHex(g)}${toHex(b)}`.toUpperCase();
+      };
 
       let elementIndex = 0;
 
@@ -78,8 +89,7 @@ export const extractTypographyData = async (
     },
     TEXT_SELECTORS,
     includeHidden,
-    maxElements,
-    rgbToHex.toString()
+    maxElements
   );
 };
 

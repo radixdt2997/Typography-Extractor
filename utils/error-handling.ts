@@ -57,3 +57,9 @@ export const mapErrorToResponse = (error: Error): ErrorMapping => {
     status: 500,
   };
 };
+
+export const handleApiError = (error: unknown): string => {
+  return error instanceof Error
+    ? error.message
+    : "An unexpected error occurred";
+};

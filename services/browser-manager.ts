@@ -79,7 +79,11 @@ export const setupPage = async (page: Page): Promise<void> => {
       request.url().includes("analytics") ||
       request.url().includes("tracking");
 
-    shouldBlock ? request.abort() : request.continue();
+    if (shouldBlock) {
+      request.abort();
+    } else {
+      request.continue();
+    }
   });
 
   page.on("pageerror", (error) => {
