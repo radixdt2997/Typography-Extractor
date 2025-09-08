@@ -1,0 +1,1272 @@
+Directory structure:
+└── ingest/
+    ├── page-navigation.ts
+    ├── typography-extractor.ts
+    └── use-element-selection.ts
+
+================================================
+File: page-navigation.ts
+================================================
+import { CONFIG } from '@/config/constants'
+import { Page } from 'playwright'
+
+/**
+ * Enhanced page navigation with Playwright's robust loading strategies
+ */
+export const navigateToPage = async (page: Page, url: string, timeout: number): Promise<void> => {
+    const navigationStrategies = [
+        { waitUntil: 'networkidle' as const, timeout },
+        { waitUntil: 'domcontentloaded' as const, timeout: timeout + 5000 },
+        { waitUntil: 'load' as const, timeout: timeout + 10000 },
+    ] as const
+
+    for (const [index, strategy] of navigationStrategies.entries()) {
+        try {
+            await page.goto(url, {
+                waitUntil: strategy.waitUntil,
+                timeout: strategy.timeout,
+            })
+
+            // Verify page is actually loaded
+            await page.waitForLoadState('domcontentloaded', {
+                timeout: CONFIG.TIMEOUT.LOAD_STATE,
+            })
+
+            console.log(`Navigation successful with strategy ${index + 1}`)
+            break
+        } catch (error) {
+            if (index === navigationStrategies.length - 1) {
+                throw new Error(
+                    `Navigation failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
+                )
+            }
+            console.warn(`Navigation attempt ${index + 1} failed, trying next strategy`)
+        }
+    }
+
+    // Wait for essential elements and fonts to load
+    try {
+        await Promise.race([
+            page.waitForSelector('body', { timeout: CONFIG.TIMEOUT.SELECTOR_WAIT }),
+            page.waitForTimeout(CONFIG.TIMEOUT.SELECTOR_WAIT),
+        ])
+
+        // Wait for fonts to load (important for typography analysis)
+        await page.evaluate(() => {
+            return document.fonts ? document.fonts.ready.then(() => {}) : Promise.resolve()
+        })
+    } catch {
+        console.warn('Body selector or font loading wait failed, continuing...')
+    }
+}
+
+/**
+ * Intelligent page scrolling with dynamic content detection
+ */
+export const optimizedPageScroll = async (page: Page): Promise<void> => {
+    try {
+        // First, ensure we're at the top
+        await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'instant' }))
+        await page.waitForTimeout(500)
+
+        const scrollInfo = await page.evaluate(() => {
+            const body = document.body
+            const documentElement = document.documentElement
+
+            return {
+                scrollHeight: Math.max(
+                    body.scrollHeight,
+                    body.offsetHeight,
+                    documentElement.clientHeight,
+                    documentElement.scrollHeight,
+                    documentElement.offsetHeight,
+                ),
+                clientHeight: window.innerHeight,
+                hasLazyContent: !!(
+                    document.querySelector('[loading="lazy"]') ||
+                    document.querySelector('[data-lazy]') ||
+                    document.querySelector('.lazy') ||
+                    document.querySelector('[data-src]')
+                ),
+            }
+        })
+
+        if (scrollInfo.scrollHeight <= scrollInfo.clientHeight) {
+            console.log('Page fits in viewport, no scrolling needed')
+            return
+        }
+
+        const scrollSteps = Math.min(
+            Math.ceil(scrollInfo.scrollHeight / CONFIG.SCROLL.STEP),
+            20, // Limit maximum scrolls
+        )
+
+        console.log(`Scrolling page: ${scrollSteps} steps for ${scrollInfo.scrollHeight}px height`)
+
+        // Enhanced scrolling with lazy content detection
+        for (let i = 0; i <= scrollSteps; i++) {
+            const scrollPosition = Math.min(
+                i * CONFIG.SCROLL.STEP,
+                scrollInfo.scrollHeight - scrollInfo.clientHeight,
+            )
+
+            await page.evaluate((position) => {
+                window.scrollTo({ top: position, behavior: 'instant' })
+            }, scrollPosition)
+
+            // Longer delay if lazy content detected
+            const delay = scrollInfo.hasLazyContent ? CONFIG.SCROLL.DELAY * 2 : CONFIG.SCROLL.DELAY
+            await page.waitForTimeout(delay)
+
+            // Check if new content loaded
+            if (i % 3 === 0 && scrollInfo.hasLazyContent) {
+                await page.waitForLoadState('networkidle', { timeout: 2000 }).catch(() => {})
+            }
+        }
+
+        await page.waitForTimeout(CONFIG.SCROLL.FINAL_WAIT)
+
+        // Final check for any pending network requests
+        await page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {})
+
+        // CRITICAL: Reset to top after scrolling to ensure screenshot consistency
+        await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'instant' }))
+        await page.waitForTimeout(1000)
+
+        console.log('Page scrolling completed and reset to top')
+    } catch (error) {
+        console.warn('Page scrolling failed:', error)
+    }
+}
+
+/**
+ * Wait for page stability (useful for dynamic sites)
+ */
+export const waitForPageStability = async (page: Page): Promise<void> => {
+    try {
+        // Wait for network to be idle
+        await page.waitForLoadState('networkidle', { timeout: 5000 })
+
+        // Wait for any pending DOM changes
+        await page.evaluate(() => {
+            return new Promise<void>((resolve) => {
+                if (typeof window.requestIdleCallback !== 'undefined') {
+                    window.requestIdleCallback(() => resolve(), { timeout: 2000 })
+                } else {
+                    setTimeout(resolve, 1000)
+                }
+            })
+        })
+    } catch (error) {
+        console.warn('Page stability wait failed:', error)
+    }
+}
+
+
+
+================================================
+File: typography-extractor.ts
+================================================
+import { TEXT_SELECTORS } from '@/config/constants'
+import { EnhancedTypographyElement, SemanticInfo, TypographySummary } from '@/types/typography'
+import { Page } from 'playwright'
+
+/**
+ * Enhanced typography data extraction with better error handling and CRITICAL scroll fix
+ */
+export const extractTypographyData = async (
+    page: Page,
+    includeHidden: boolean,
+    maxElements: number,
+): Promise<EnhancedTypographyElement[]> => {
+    return page.evaluate(
+        ({ selectors, includeHidden, maxElements }) => {
+            const elements: EnhancedTypographyElement[] = []
+
+            try {
+                const allElements = document.querySelectorAll(selectors.join(', '))
+
+                // Enhanced color conversion with comprehensive format support
+                const rgbToHex = (rgb: string): string => {
+                    try {
+                        if (rgb.startsWith('#')) return rgb.toUpperCase()
+                        if (rgb === 'transparent' || rgb === '') return 'transparent'
+                        if (rgb === 'inherit') return 'inherit'
+
+                        const rgbMatch = rgb.match(
+                            /rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/,
+                        )
+                        if (!rgbMatch) return rgb
+
+                        const [, r, g, b, a] = rgbMatch
+                        const red = parseInt(r, 10)
+                        const green = parseInt(g, 10)
+                        const blue = parseInt(b, 10)
+                        const alpha = a ? parseFloat(a) : 1
+
+                        if ([red, green, blue].some((val) => val > 255 || val < 0)) return rgb
+
+                        const toHex = (n: number): string => n.toString(16).padStart(2, '0')
+                        const hex = `#${toHex(red)}${toHex(green)}${toHex(blue)}`.toUpperCase()
+
+                        return alpha < 1 ? `${hex} (${Math.round(alpha * 100)}%)` : hex
+                    } catch {
+                        return rgb
+                    }
+                }
+
+                // Get effective background color by traversing up the DOM tree
+                const getEffectiveBackgroundColor = (element: HTMLElement): string => {
+                    try {
+                        let current = element as Element | null
+                        let depth = 0
+                        const maxDepth = 10
+
+                        while (current && depth < maxDepth) {
+                            const computedStyle = window.getComputedStyle(current)
+                            const bgColor = computedStyle.backgroundColor
+
+                            if (
+                                bgColor &&
+                                bgColor !== 'transparent' &&
+                                bgColor !== 'rgba(0, 0, 0, 0)'
+                            ) {
+                                const hexColor = rgbToHex(bgColor)
+                                if (hexColor !== 'transparent' && hexColor.startsWith('#')) {
+                                    return hexColor
+                                }
+                            }
+
+                            current = current.parentElement
+                            depth++
+                        }
+
+                        // Fallback to document body or white
+                        const bodyBg = window.getComputedStyle(document.body).backgroundColor
+                        if (bodyBg && bodyBg !== 'transparent') {
+                            const hexBodyBg = rgbToHex(bodyBg)
+                            if (hexBodyBg.startsWith('#')) {
+                                return hexBodyBg
+                            }
+                        }
+
+                        // Ultimate fallback - assume white background
+                        return '#FFFFFF'
+                    } catch {
+                        return '#FFFFFF'
+                    }
+                }
+
+                // Calculate contrast ratio for accessibility
+                const getContrastRatio = (foreground: string, background: string): number => {
+                    try {
+                        const getLuminance = (hex: string): number => {
+                            if (!hex.startsWith('#')) return 0
+
+                            // Handle both 3 and 6 character hex codes
+                            let cleanHex = hex.slice(1)
+                            if (cleanHex.length === 3) {
+                                cleanHex = cleanHex
+                                    .split('')
+                                    .map((c) => c + c)
+                                    .join('')
+                            }
+                            if (cleanHex.length !== 6) return 0
+
+                            const r = parseInt(cleanHex.slice(0, 2), 16) / 255
+                            const g = parseInt(cleanHex.slice(2, 4), 16) / 255
+                            const b = parseInt(cleanHex.slice(4, 6), 16) / 255
+
+                            const sRGB = [r, g, b].map((c) =>
+                                c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4),
+                            )
+
+                            return 0.2126 * sRGB[0] + 0.7152 * sRGB[1] + 0.0722 * sRGB[2]
+                        }
+
+                        // Handle percentage alpha values
+                        const cleanForeground = foreground.includes('(')
+                            ? foreground.split('(')[0]
+                            : foreground
+                        const cleanBackground = background.includes('(')
+                            ? background.split('(')[0]
+                            : background
+
+                        const l1 = getLuminance(cleanForeground)
+                        const l2 = getLuminance(cleanBackground)
+                        const lighter = Math.max(l1, l2)
+                        const darker = Math.min(l1, l2)
+
+                        return (lighter + 0.05) / (darker + 0.05)
+                    } catch {
+                        return 0
+                    }
+                }
+
+                // Get element hierarchy for better context
+                const getElementHierarchy = (element: Element): string => {
+                    try {
+                        const path = []
+                        let current = element as Element | null
+                        let depth = 0
+
+                        while (current && current !== document.body && depth < 5) {
+                            let selector = current.tagName.toLowerCase()
+                            if (current.id) {
+                                selector += `#${current.id}`
+                            } else if (current.className) {
+                                const classes = current.className.trim().split(/\s+/).slice(0, 2)
+                                if (classes.length > 0) {
+                                    selector += `.${classes.join('.')}`
+                                }
+                            }
+                            path.unshift(selector)
+                            current = current.parentElement
+                            if (!current) break
+                            depth++
+                        }
+
+                        return path.join(' > ')
+                    } catch {
+                        return 'unknown'
+                    }
+                }
+
+                // Extract semantic information with proper typing
+                const getSemanticInfo = (element: HTMLElement): SemanticInfo => {
+                    try {
+                        const tagName = element.tagName.toLowerCase()
+                        let role: SemanticInfo['role'] = 'text'
+                        let importance = 1
+                        let context: SemanticInfo['context'] = 'body'
+
+                        // Determine semantic role with strict typing
+                        if (['h1', 'h2', 'h3', 'h4', 'h5', 'h6'].includes(tagName)) {
+                            role = 'heading'
+                            importance = 7 - parseInt(tagName[1], 10) // h1=6, h2=5, etc.
+                        } else if (
+                            tagName === 'button' ||
+                            element.getAttribute('role') === 'button'
+                        ) {
+                            role = 'interactive'
+                            importance = 4
+                        } else if (tagName === 'a') {
+                            role = 'link'
+                            importance = 3
+                        } else if (['strong', 'b', 'em', 'i', 'mark'].includes(tagName)) {
+                            role = 'emphasis'
+                            importance = 2
+                        } else {
+                            role = 'text'
+                        }
+
+                        // Determine context with strict typing
+                        const nav = element.closest('nav')
+                        const header = element.closest('header')
+                        const footer = element.closest('footer')
+                        const main = element.closest('main')
+                        const aside = element.closest('aside')
+
+                        if (nav) context = 'navigation'
+                        else if (header) context = 'header'
+                        else if (footer) context = 'footer'
+                        else if (main) context = 'main'
+                        else if (aside) context = 'sidebar'
+                        else context = 'body'
+
+                        return { role, importance, context }
+                    } catch {
+                        return { role: 'text', importance: 1, context: 'body' }
+                    }
+                }
+
+                let elementIndex = 0
+
+                for (const element of allElements) {
+                    if (elements.length >= maxElements) break
+
+                    try {
+                        const htmlElement = element as HTMLElement
+                        const text = htmlElement.innerText?.trim()
+
+                        if (!text || text.length < 1) continue
+
+                        const computedStyle = window.getComputedStyle(htmlElement)
+                        const rect = htmlElement.getBoundingClientRect()
+
+                        // Enhanced visibility check
+                        if (!includeHidden) {
+                            const isVisible =
+                                computedStyle.display !== 'none' &&
+                                computedStyle.visibility !== 'hidden' &&
+                                parseFloat(computedStyle.opacity) > 0 &&
+                                rect.width > 0 &&
+                                rect.height > 0
+
+                            if (!isVisible) continue
+                        }
+
+                        if (rect.width === 0 || rect.height === 0) continue
+
+                        // Extract enhanced typography properties
+                        const foregroundColor = rgbToHex(computedStyle.color || '')
+                        const backgroundColor = getEffectiveBackgroundColor(htmlElement)
+                        const semanticInfo = getSemanticInfo(htmlElement)
+
+                        // Calculate derived properties
+                        const fontSize = parseFloat(computedStyle.fontSize) || 16
+                        const lineHeight =
+                            computedStyle.lineHeight === 'normal'
+                                ? fontSize * 1.2
+                                : parseFloat(computedStyle.lineHeight) || fontSize * 1.2
+
+                        // Enhanced contrast calculation with better validation
+                        const contrastRatio =
+                            foregroundColor.startsWith('#') &&
+                            backgroundColor.startsWith('#') &&
+                            foregroundColor !== 'transparent' &&
+                            backgroundColor !== 'transparent'
+                                ? getContrastRatio(foregroundColor, backgroundColor)
+                                : 0
+
+                        // CRITICAL FIX: Use viewport-relative coordinates for screenshot consistency
+                        // This ensures coordinates match the screenshot regardless of scroll position
+                        elements.push({
+                            // Original properties
+                            id: `element-${elementIndex++}`,
+                            tagName: htmlElement.tagName.toLowerCase(),
+                            text: text.slice(0, 300),
+                            styles: {
+                                fontFamily: computedStyle.fontFamily || '',
+                                fontSize: computedStyle.fontSize || '',
+                                fontWeight: computedStyle.fontWeight || '',
+                                lineHeight: computedStyle.lineHeight || '',
+                                color: foregroundColor,
+                                letterSpacing: computedStyle.letterSpacing || '',
+                                textAlign: computedStyle.textAlign || '',
+                                textTransform: computedStyle.textTransform || '',
+                                fontStyle: computedStyle.fontStyle || '',
+                                textDecoration: computedStyle.textDecoration || '',
+                                fontVariant: computedStyle.fontVariant || '',
+                            },
+                            position: {
+                                // CRITICAL FIX: Use viewport-relative coordinates that match screenshot
+                                // This fixes the scroll selection issue by ensuring coordinates are consistent
+                                x: Math.round(rect.left),
+                                y: Math.round(rect.top),
+                                width: Math.round(rect.width),
+                                height: Math.round(rect.height),
+                            },
+                            computedStyles: {
+                                marginTop: computedStyle.marginTop || '',
+                                marginBottom: computedStyle.marginBottom || '',
+                                paddingTop: computedStyle.paddingTop || '',
+                                paddingBottom: computedStyle.paddingBottom || '',
+                            },
+
+                            // Enhanced properties for better UX
+                            enhanced: {
+                                // Accessibility information
+                                accessibility: {
+                                    contrastRatio: Math.round(contrastRatio * 100) / 100,
+                                    wcagLevel:
+                                        contrastRatio >= 7
+                                            ? 'AAA'
+                                            : contrastRatio >= 4.5
+                                              ? 'AA'
+                                              : 'Fail',
+                                    isReadable: contrastRatio >= 4.5,
+                                },
+
+                                // Semantic information
+                                semantic: semanticInfo,
+
+                                // Visual properties
+                                visual: {
+                                    backgroundColor,
+                                    borderRadius: computedStyle.borderRadius || '',
+                                    boxShadow: computedStyle.boxShadow || '',
+                                    textShadow: computedStyle.textShadow || '',
+                                    opacity: computedStyle.opacity || '1',
+                                },
+
+                                // Layout information
+                                layout: {
+                                    display: computedStyle.display || '',
+                                    position: computedStyle.position || '',
+                                    zIndex: computedStyle.zIndex || '',
+                                    flexDirection: computedStyle.flexDirection || '',
+                                    justifyContent: computedStyle.justifyContent || '',
+                                    alignItems: computedStyle.alignItems || '',
+                                },
+
+                                // Typography metrics
+                                metrics: {
+                                    characterCount: text.length,
+                                    wordCount: text.split(/\s+/).length,
+                                    estimatedReadingTime: Math.ceil(text.split(/\s+/).length / 200), // seconds
+                                    fontSizePixels: fontSize,
+                                    lineHeightPixels: lineHeight,
+                                    lineHeightRatio:
+                                        Math.round((lineHeight / fontSize) * 100) / 100,
+                                },
+
+                                // Element identification
+                                identification: {
+                                    hierarchy: getElementHierarchy(htmlElement),
+                                    xpath: getElementHierarchy(htmlElement), // Using hierarchy as xpath for now
+                                    classes: htmlElement.className.trim().split(/\s+/).slice(0, 5),
+                                    id: htmlElement.id || null,
+                                },
+
+                                // Interactive properties
+                                interaction: {
+                                    isClickable:
+                                        htmlElement.tagName.toLowerCase() === 'a' ||
+                                        htmlElement.tagName.toLowerCase() === 'button' ||
+                                        computedStyle.cursor === 'pointer' ||
+                                        htmlElement.getAttribute('onclick') !== null,
+                                    isFormElement: [
+                                        'input',
+                                        'textarea',
+                                        'select',
+                                        'button',
+                                    ].includes(htmlElement.tagName.toLowerCase()),
+                                    tabIndex: htmlElement.tabIndex,
+                                },
+                            },
+                        })
+                    } catch (error) {
+                        console.warn('Error processing element:', error)
+                        continue
+                    }
+                }
+            } catch (error) {
+                console.error('Error in extractTypographyData:', error)
+            }
+
+            return elements
+        },
+        {
+            selectors: TEXT_SELECTORS,
+            includeHidden,
+            maxElements,
+        },
+    )
+}
+
+/**
+ * Enhanced typography summary with additional insights
+ */
+export const generateSummary = (
+    elements: readonly EnhancedTypographyElement[],
+): TypographySummary => {
+    const extractUnique = <T>(
+        mapper: (el: EnhancedTypographyElement) => T,
+        limit: number,
+    ): readonly string[] => {
+        const mapped = elements.map(mapper).filter(Boolean) as string[]
+        return [...new Set(mapped)].slice(0, limit)
+    }
+
+    const accessibilityStats = elements.reduce(
+        (acc, el) => {
+            const level = el.enhanced.accessibility.wcagLevel
+            acc[level] = (acc[level] || 0) + 1
+            return acc
+        },
+        {} as Record<string, number>,
+    )
+
+    const semanticStats = elements.reduce(
+        (acc, el) => {
+            const role = el.enhanced.semantic.role
+            acc[role] = (acc[role] || 0) + 1
+            return acc
+        },
+        {} as Record<string, number>,
+    )
+
+    const contextStats = elements.reduce(
+        (acc, el) => {
+            const context = el.enhanced.semantic.context
+            acc[context] = (acc[context] || 0) + 1
+            return acc
+        },
+        {} as Record<string, number>,
+    )
+
+    return {
+        totalElements: elements.length,
+        uniqueFonts: extractUnique((el) => el.styles.fontFamily, 50),
+        fontSizes: extractUnique((el) => el.styles.fontSize, 30),
+        colors: extractUnique((el) => el.styles.color, 30),
+        fontWeights: extractUnique((el) => el.styles.fontWeight, 20),
+        textAlignments: extractUnique((el) => el.styles.textAlign, 10),
+
+        // Enhanced summary statistics
+        enhanced: {
+            accessibility: {
+                totalChecked: elements.length,
+                wcagStats: accessibilityStats,
+                averageContrast:
+                    Math.round(
+                        (elements.reduce(
+                            (sum, el) => sum + el.enhanced.accessibility.contrastRatio,
+                            0,
+                        ) /
+                            elements.length) *
+                            100,
+                    ) / 100,
+                readableCount: elements.filter((el) => el.enhanced.accessibility.isReadable).length,
+            },
+
+            semantic: {
+                roleDistribution: semanticStats,
+                contextDistribution: contextStats,
+                interactiveElements: elements.filter((el) => el.enhanced.interaction.isClickable)
+                    .length,
+                headingHierarchy: elements
+                    .filter((el) => el.enhanced.semantic.role === 'heading')
+                    .map((el) => ({ tag: el.tagName, text: el.text.slice(0, 50) }))
+                    .slice(0, 10),
+            },
+
+            typography: {
+                averageFontSize: Math.round(
+                    elements.reduce((sum, el) => sum + el.enhanced.metrics.fontSizePixels, 0) /
+                        elements.length,
+                ),
+                averageLineHeight:
+                    Math.round(
+                        (elements.reduce(
+                            (sum, el) => sum + el.enhanced.metrics.lineHeightRatio,
+                            0,
+                        ) /
+                            elements.length) *
+                            100,
+                    ) / 100,
+                totalWordCount: elements.reduce(
+                    (sum, el) => sum + el.enhanced.metrics.wordCount,
+                    0,
+                ),
+                estimatedReadingTime: Math.ceil(
+                    elements.reduce(
+                        (sum, el) => sum + el.enhanced.metrics.estimatedReadingTime,
+                        0,
+                    ) / 60,
+                ), // in minutes
+                fontFamilyUsage: extractUnique((el) => el.styles.fontFamily, 10).map((font) => ({
+                    family: font,
+                    usage: elements.filter((el) => el.styles.fontFamily === font).length,
+                })),
+            },
+
+            layout: {
+                displayTypes: extractUnique((el) => el.enhanced.layout.display, 15),
+                positionTypes: extractUnique((el) => el.enhanced.layout.position, 10),
+                flexboxUsage: elements.filter((el) => el.enhanced.layout.display.includes('flex'))
+                    .length,
+            },
+        },
+    } as const
+}
+
+/**
+ * CRITICAL FIX: Enhanced screenshot capture that ensures full document capture
+ */
+export const captureScreenshot = async (page: Page): Promise<string> => {
+    try {
+        // CRITICAL: Reset to top and ensure we capture the FULL document
+        await page.evaluate(() => {
+            window.scrollTo({ top: 0, left: 0, behavior: 'instant' })
+        })
+        await page.waitForTimeout(1000)
+
+        // Get actual document dimensions to ensure full capture
+        const documentInfo = await page.evaluate(() => {
+            const body = document.body
+            const documentElement = document.documentElement
+
+            return {
+                scrollHeight: Math.max(
+                    body.scrollHeight,
+                    body.offsetHeight,
+                    documentElement.clientHeight,
+                    documentElement.scrollHeight,
+                    documentElement.offsetHeight,
+                ),
+                scrollWidth: Math.max(
+                    body.scrollWidth,
+                    body.offsetWidth,
+                    documentElement.clientWidth,
+                    documentElement.scrollWidth,
+                    documentElement.offsetWidth,
+                ),
+                viewportHeight: window.innerHeight,
+                viewportWidth: window.innerWidth,
+            }
+        })
+
+        console.log('Document dimensions:', documentInfo)
+
+        // Wait for network to be mostly idle and images to load
+        await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {
+            console.log('Network idle timeout, proceeding with screenshot')
+        })
+
+        // Wait for fonts and images to load
+        await page
+            .waitForFunction(
+                () => {
+                    const images = Array.from(document.images)
+                    return images.every((img) => img.complete)
+                },
+                { timeout: 3000 },
+            )
+            .catch(() => {
+                console.log('Image loading timeout, proceeding with screenshot')
+            })
+
+        // Additional wait for layout stability
+        await page.waitForTimeout(2000)
+
+        // Force full page screenshot with explicit dimensions
+        let screenshot: Buffer
+        try {
+            // Set viewport to ensure we can capture everything
+            await page.setViewportSize({
+                width: Math.min(documentInfo.scrollWidth, 1920),
+                height: Math.min(documentInfo.viewportHeight, 1080),
+            })
+
+            screenshot = await page.screenshot({
+                type: 'png',
+                fullPage: true,
+                animations: 'disabled',
+                timeout: 60000,
+                clip: undefined, // Ensure no clipping
+            })
+
+            console.log('Full page screenshot captured successfully')
+        } catch (fullPageError) {
+            console.warn('Full page screenshot failed, trying viewport screenshot:', fullPageError)
+
+            // Fallback: Try manual scrolling screenshot approach
+            try {
+                const screenshots: Buffer[] = []
+                const viewportHeight = documentInfo.viewportHeight
+                const totalHeight = documentInfo.scrollHeight
+                const scrollSteps = Math.ceil(totalHeight / viewportHeight)
+
+                console.log(`Attempting manual scroll capture: ${scrollSteps} steps`)
+
+                for (let i = 0; i < scrollSteps; i++) {
+                    const scrollY = i * viewportHeight
+                    await page.evaluate((y) => {
+                        window.scrollTo({ top: y, behavior: 'instant' })
+                    }, scrollY)
+                    await page.waitForTimeout(500)
+
+                    const viewportScreenshot = await page.screenshot({
+                        type: 'png',
+                        fullPage: false,
+                        animations: 'disabled',
+                        timeout: 10000,
+                    })
+                    screenshots.push(viewportScreenshot)
+                }
+
+                // Reset to top after manual capture
+                await page.evaluate(() => {
+                    window.scrollTo({ top: 0, behavior: 'instant' })
+                })
+
+                // For now, use the first screenshot (we'd need image stitching for full manual approach)
+                screenshot = screenshots[0]
+                console.log('Manual scroll screenshot approach used')
+            } catch (manualError) {
+                console.warn('Manual scroll screenshot failed:', manualError)
+                // Final fallback to simple viewport screenshot
+                screenshot = await page.screenshot({
+                    type: 'png',
+                    fullPage: false,
+                    animations: 'disabled',
+                    timeout: 8000,
+                })
+            }
+        }
+
+        return `data:image/png;base64,${screenshot.toString('base64')}`
+    } catch (error) {
+        console.warn('Screenshot capture failed:', error)
+
+        // Last resort: try a basic viewport screenshot with minimal timeout
+        try {
+            const fallbackScreenshot = await page.screenshot({
+                type: 'png',
+                fullPage: false,
+                animations: 'disabled',
+                timeout: 5000,
+            })
+            return `data:image/png;base64,${fallbackScreenshot.toString('base64')}`
+        } catch (fallbackError) {
+            console.warn('Fallback screenshot also failed:', fallbackError)
+            return ''
+        }
+    }
+}
+
+/**
+ * Capture element-specific screenshot for click interactions
+ */
+export const captureElementScreenshot = async (page: Page, elementId: string): Promise<string> => {
+    try {
+        const element = await page.locator(`[data-typography-id="${elementId}"]`).first()
+
+        if ((await element.count()) === 0) {
+            throw new Error(`Element with ID ${elementId} not found`)
+        }
+
+        const screenshot = await element.screenshot({
+            type: 'png',
+            timeout: 5000,
+        })
+
+        return `data:image/png;base64,${screenshot.toString('base64')}`
+    } catch (error) {
+        console.warn(`Element screenshot failed for ${elementId}:`, error)
+        return ''
+    }
+}
+
+/**
+ * Add data attributes to elements for click tracking with better error handling
+ */
+export const addClickableAttributes = async (page: Page): Promise<void> => {
+    try {
+        await page.evaluate((selectors) => {
+            try {
+                const elements = document.querySelectorAll(selectors.join(', '))
+                let index = 0
+
+                elements.forEach((element) => {
+                    try {
+                        const htmlElement = element as HTMLElement
+                        const text = htmlElement.innerText?.trim()
+
+                        if (text && text.length > 0) {
+                            htmlElement.setAttribute('data-typography-id', `element-${index++}`)
+                            htmlElement.style.cursor = 'pointer'
+
+                            // Add subtle highlight effect with error handling
+                            htmlElement.addEventListener('mouseenter', () => {
+                                try {
+                                    htmlElement.style.outline = '2px solid rgba(59, 130, 246, 0.5)'
+                                    htmlElement.style.backgroundColor = 'rgba(59, 130, 246, 0.1)'
+                                } catch (e) {
+                                    console.warn('Mouseenter error:', e)
+                                }
+                            })
+
+                            htmlElement.addEventListener('mouseleave', () => {
+                                try {
+                                    htmlElement.style.outline = ''
+                                    htmlElement.style.backgroundColor = ''
+                                } catch (e) {
+                                    console.warn('Mouseleave error:', e)
+                                }
+                            })
+                        }
+                    } catch (error) {
+                        console.warn('Error processing element for click tracking:', error)
+                    }
+                })
+            } catch (error) {
+                console.error('Error in addClickableAttributes:', error)
+            }
+        }, TEXT_SELECTORS)
+    } catch (error) {
+        console.warn('Failed to add clickable attributes:', error)
+    }
+}
+
+/**
+ * Get detailed typography information for a specific element
+ */
+export const getElementDetails = async (
+    page: Page,
+    elementId: string,
+): Promise<EnhancedTypographyElement | null> => {
+    try {
+        return await page.evaluate((id) => {
+            try {
+                const element = document.querySelector(
+                    `[data-typography-id="${id}"]`,
+                ) as HTMLElement
+                if (!element) return null
+
+                const computedStyle = window.getComputedStyle(element)
+                const rect = element.getBoundingClientRect()
+                const text = element.innerText?.trim() || ''
+
+                // Same utility functions as in extractTypographyData with error handling
+                const rgbToHex = (rgb: string): string => {
+                    try {
+                        if (rgb.startsWith('#')) return rgb.toUpperCase()
+                        if (rgb === 'transparent' || rgb === '') return 'transparent'
+
+                        const rgbMatch = rgb.match(
+                            /rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/,
+                        )
+                        if (!rgbMatch) return rgb
+
+                        const [, r, g, b, a] = rgbMatch
+                        const red = parseInt(r, 10)
+                        const green = parseInt(g, 10)
+                        const blue = parseInt(b, 10)
+                        const alpha = a ? parseFloat(a) : 1
+
+                        if ([red, green, blue].some((val) => val > 255 || val < 0)) return rgb
+
+                        const toHex = (n: number): string => n.toString(16).padStart(2, '0')
+                        const hex = `#${toHex(red)}${toHex(green)}${toHex(blue)}`.toUpperCase()
+
+                        return alpha < 1 ? `${hex} (${Math.round(alpha * 100)}%)` : hex
+                    } catch {
+                        return rgb
+                    }
+                }
+
+                const getContrastRatio = (foreground: string, background: string): number => {
+                    try {
+                        const getLuminance = (hex: string): number => {
+                            if (!hex.startsWith('#') || hex.length !== 7) return 0
+
+                            const r = parseInt(hex.slice(1, 3), 16) / 255
+                            const g = parseInt(hex.slice(3, 5), 16) / 255
+                            const b = parseInt(hex.slice(5, 7), 16) / 255
+
+                            const sRGB = [r, g, b].map((c) =>
+                                c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4),
+                            )
+
+                            return 0.2126 * sRGB[0] + 0.7152 * sRGB[1] + 0.0722 * sRGB[2]
+                        }
+
+                        const l1 = getLuminance(foreground)
+                        const l2 = getLuminance(background)
+                        const lighter = Math.max(l1, l2)
+                        const darker = Math.min(l1, l2)
+
+                        return (lighter + 0.05) / (darker + 0.05)
+                    } catch {
+                        return 0
+                    }
+                }
+
+                const getElementHierarchy = (element: Element): string => {
+                    try {
+                        const path = []
+                        let current = element as Element | null
+                        let depth = 0
+
+                        while (current && current !== document.body && depth < 5) {
+                            let selector = current.tagName.toLowerCase()
+                            if (current.id) {
+                                selector += `#${current.id}`
+                            } else if (current.className) {
+                                const classes = current.className.trim().split(/\s+/).slice(0, 2)
+                                if (classes.length > 0) {
+                                    selector += `.${classes.join('.')}`
+                                }
+                            }
+                            path.unshift(selector)
+                            current = current.parentElement
+                            if (!current) break
+                            depth++
+                        }
+
+                        return path.join(' > ')
+                    } catch {
+                        return 'unknown'
+                    }
+                }
+
+                const getSemanticInfo = (
+                    element: HTMLElement,
+                ): {
+                    role: 'heading' | 'text' | 'link' | 'interactive' | 'emphasis'
+                    importance: number
+                    context: 'header' | 'navigation' | 'main' | 'sidebar' | 'footer' | 'body'
+                } => {
+                    try {
+                        const tagName = element.tagName.toLowerCase()
+                        let role: 'heading' | 'text' | 'link' | 'interactive' | 'emphasis' = 'text'
+                        let importance = 1
+                        let context:
+                            | 'header'
+                            | 'navigation'
+                            | 'main'
+                            | 'sidebar'
+                            | 'footer'
+                            | 'body' = 'body'
+
+                        // Determine semantic role
+                        if (['h1', 'h2', 'h3', 'h4', 'h5', 'h6'].includes(tagName)) {
+                            role = 'heading'
+                            importance = 7 - parseInt(tagName[1], 10)
+                        } else if (
+                            tagName === 'button' ||
+                            element.getAttribute('role') === 'button'
+                        ) {
+                            role = 'interactive'
+                            importance = 4
+                        } else if (tagName === 'a') {
+                            role = 'link'
+                            importance = 3
+                        } else if (['strong', 'b', 'em', 'i', 'mark'].includes(tagName)) {
+                            role = 'emphasis'
+                            importance = 2
+                        }
+
+                        // Determine context
+                        const nav = element.closest('nav')
+                        const header = element.closest('header')
+                        const footer = element.closest('footer')
+                        const main = element.closest('main')
+                        const aside = element.closest('aside')
+
+                        if (nav) context = 'navigation'
+                        else if (header) context = 'header'
+                        else if (footer) context = 'footer'
+                        else if (main) context = 'main'
+                        else if (aside) context = 'sidebar'
+
+                        return { role, importance, context }
+                    } catch {
+                        return { role: 'text', importance: 1, context: 'body' }
+                    }
+                }
+
+                // Extract all properties for the specific element
+                const foregroundColor = rgbToHex(computedStyle.color || '')
+                const backgroundColor = rgbToHex(computedStyle.backgroundColor || '')
+                const semanticInfo = getSemanticInfo(element)
+
+                const fontSize = parseFloat(computedStyle.fontSize) || 16
+                const lineHeight =
+                    computedStyle.lineHeight === 'normal'
+                        ? fontSize * 1.2
+                        : parseFloat(computedStyle.lineHeight) || fontSize * 1.2
+
+                const contrastRatio =
+                    foregroundColor.startsWith('#') && backgroundColor.startsWith('#')
+                        ? getContrastRatio(foregroundColor, backgroundColor)
+                        : 0
+
+                // CRITICAL FIX: Use viewport-relative coordinates for consistency
+                return {
+                    id,
+                    tagName: element.tagName.toLowerCase(),
+                    text: text.slice(0, 300),
+                    styles: {
+                        fontFamily: computedStyle.fontFamily || '',
+                        fontSize: computedStyle.fontSize || '',
+                        fontWeight: computedStyle.fontWeight || '',
+                        lineHeight: computedStyle.lineHeight || '',
+                        color: foregroundColor,
+                        letterSpacing: computedStyle.letterSpacing || '',
+                        textAlign: computedStyle.textAlign || '',
+                        textTransform: computedStyle.textTransform || '',
+                        fontStyle: computedStyle.fontStyle || '',
+                        textDecoration: computedStyle.textDecoration || '',
+                        fontVariant: computedStyle.fontVariant || '',
+                    },
+                    position: {
+                        // CRITICAL FIX: Use viewport-relative coordinates
+                        x: Math.round(rect.left),
+                        y: Math.round(rect.top),
+                        width: Math.round(rect.width),
+                        height: Math.round(rect.height),
+                    },
+                    computedStyles: {
+                        marginTop: computedStyle.marginTop || '',
+                        marginBottom: computedStyle.marginBottom || '',
+                        paddingTop: computedStyle.paddingTop || '',
+                        paddingBottom: computedStyle.paddingBottom || '',
+                    },
+                    enhanced: {
+                        accessibility: {
+                            contrastRatio: Math.round(contrastRatio * 100) / 100,
+                            wcagLevel:
+                                contrastRatio >= 7 ? 'AAA' : contrastRatio >= 4.5 ? 'AA' : 'Fail',
+                            isReadable: contrastRatio >= 4.5,
+                        },
+                        semantic: semanticInfo,
+                        visual: {
+                            backgroundColor,
+                            borderRadius: computedStyle.borderRadius || '',
+                            boxShadow: computedStyle.boxShadow || '',
+                            textShadow: computedStyle.textShadow || '',
+                            opacity: computedStyle.opacity || '1',
+                        },
+                        layout: {
+                            display: computedStyle.display || '',
+                            position: computedStyle.position || '',
+                            zIndex: computedStyle.zIndex || '',
+                            flexDirection: computedStyle.flexDirection || '',
+                            justifyContent: computedStyle.justifyContent || '',
+                            alignItems: computedStyle.alignItems || '',
+                        },
+                        metrics: {
+                            characterCount: text.length,
+                            wordCount: text.split(/\s+/).length,
+                            estimatedReadingTime: Math.ceil(text.split(/\s+/).length / 200),
+                            fontSizePixels: fontSize,
+                            lineHeightPixels: lineHeight,
+                            lineHeightRatio: Math.round((lineHeight / fontSize) * 100) / 100,
+                        },
+                        identification: {
+                            hierarchy: getElementHierarchy(element),
+                            xpath: getElementHierarchy(element),
+                            classes: element.className.trim().split(/\s+/).slice(0, 5),
+                            id: element.id || null,
+                        },
+                        interaction: {
+                            isClickable:
+                                element.tagName.toLowerCase() === 'a' ||
+                                element.tagName.toLowerCase() === 'button' ||
+                                computedStyle.cursor === 'pointer' ||
+                                element.getAttribute('onclick') !== null,
+                            isFormElement: ['input', 'textarea', 'select', 'button'].includes(
+                                element.tagName.toLowerCase(),
+                            ),
+                            tabIndex: element.tabIndex,
+                        },
+                    },
+                } as EnhancedTypographyElement
+            } catch (error) {
+                console.error('Error getting element details:', error)
+                return null
+            }
+        }, elementId)
+    } catch (error) {
+        console.error('Error in getElementDetails:', error)
+        return null
+    }
+}
+
+
+
+================================================
+File: use-element-selection.ts
+================================================
+'use client'
+
+import { TypographyData } from '@/types/typography'
+import { useCallback } from 'react'
+
+interface UseElementSelectionProps {
+    typographyData: TypographyData
+    onElementSelect: (elementId: string | null) => void
+    selectedElement: string | null
+}
+
+export function useElementSelection({
+    typographyData,
+    onElementSelect,
+    selectedElement,
+}: UseElementSelectionProps) {
+    const handleElementClick = useCallback(
+        (event: React.MouseEvent, elementId: string) => {
+            event.stopPropagation()
+            onElementSelect(elementId === selectedElement ? null : elementId)
+        },
+        [selectedElement, onElementSelect],
+    )
+
+    const handleScreenshotClick = useCallback(
+        (event: React.MouseEvent<HTMLDivElement>) => {
+            if (!typographyData) return
+
+            const rect = event.currentTarget.getBoundingClientRect()
+
+            // Get the actual image element to calculate proper scaling
+            const imgElement = event.currentTarget.querySelector('img') as HTMLImageElement
+            if (!imgElement) return
+
+            const imgRect = imgElement.getBoundingClientRect()
+
+            // Calculate click position relative to the image
+            const x = event.clientX - imgRect.left
+            const y = event.clientY - imgRect.top
+
+            // Calculate scaling factors between displayed image and natural image size
+            const scaleX = imgElement.naturalWidth / imgRect.width
+            const scaleY = imgElement.naturalHeight / imgRect.height
+
+            // Convert to actual screenshot coordinates (document coordinates)
+            const actualX = x * scaleX
+            const actualY = y * scaleY
+
+            console.log('Click coordinates:', {
+                clickX: x,
+                clickY: y,
+                actualX,
+                actualY,
+                scaleX,
+                scaleY,
+                imgNaturalWidth: imgElement.naturalWidth,
+                imgNaturalHeight: imgElement.naturalHeight,
+                imgDisplayWidth: imgRect.width,
+                imgDisplayHeight: imgRect.height,
+                totalElements: typographyData.elements.length,
+            })
+
+            // Find the element at the clicked position using document coordinates
+            const clickedElement = typographyData.elements.find((element) => {
+                const { position } = element
+
+                console.log(`Checking element ${element.id}:`, {
+                    elementPos: position,
+                    clickPos: { x: actualX, y: actualY },
+                    isInBounds:
+                        actualX >= position.x &&
+                        actualX <= position.x + position.width &&
+                        actualY >= position.y &&
+                        actualY <= position.y + position.height,
+                    text: element.text.slice(0, 30),
+                })
+
+                return (
+                    actualX >= position.x &&
+                    actualX <= position.x + position.width &&
+                    actualY >= position.y &&
+                    actualY <= position.y + position.height
+                )
+            })
+
+            console.log(
+                'Clicked element:',
+                clickedElement?.id || 'none',
+                clickedElement?.text?.slice(0, 30) || '',
+            )
+
+            if (clickedElement) {
+                onElementSelect(clickedElement.id === selectedElement ? null : clickedElement.id)
+            } else {
+                // Clear selection if clicking on empty space
+                onElementSelect(null)
+            }
+        },
+        [typographyData, selectedElement, onElementSelect],
+    )
+
+    return {
+        handleElementClick,
+        handleScreenshotClick,
+    }
+}
+
+
